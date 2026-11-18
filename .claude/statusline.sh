@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Status line for Claude Code: a bar showing how much context window is left.
+# Status line for Claude Code: bars for remaining context and subscription limits.
 # Reads the status-line JSON from stdin. Requires jq.
 #
-# Example output:  Opus  [████████████░░░░░░░░] 62% контекста осталось (76k/200k)
+# Example output:
+#   Opus  [████████████░░░░░░░░] 62% контекста осталось (76k/200k)  5ч [████████░░] 77% ↻ 2ч 15м  неделя [██████░░░░] 59% ↻ 3д 4ч
 
 input=$(cat)
 BAR_WIDTH=${CONTEXT_BAR_WIDTH:-20}
@@ -44,21 +45,65 @@ fi
 (( left < 0 )) && left=0
 (( left > 100 )) && left=100
 
-# Colour: green > 50%, yellow > 20%, red otherwise.
-if   (( left > 50 )); then color=$'\033[32m'
-elif (( left > 20 )); then color=$'\033[33m'
-else                       color=$'\033[31m'
-fi
 dim=$'\033[2m'; reset=$'\033[0m'
 
-filled=$(( left * BAR_WIDTH / 100 ))
-empty=$(( BAR_WIDTH - filled ))
-bar=""
-for ((i = 0; i < filled; i++)); do bar+="█"; done
-for ((i = 0; i < empty; i++));  do bar+="░"; done
+# Colour by percent remaining: green > 50%, yellow > 20%, red otherwise.
+color_for() {
+  if   (( $1 > 50 )); then printf '\033[32m'
+  elif (( $1 > 20 )); then printf '\033[33m'
+  else                     printf '\033[31m'
+  fi
+}
+
+# bar <percent_left> <width>
+bar() {
+  local f=$(( $1 * $2 / 100 )) out="" i
+  for ((i = 0; i < f; i++));  do out+="█"; done
+  for ((i = f; i < $2; i++)); do out+="░"; done
+  printf '%s' "$out"
+}
 
 fmt_k() { awk -v n="$1" 'BEGIN { if (n >= 1000000) printf "%.1fM", n/1000000; else printf "%dk", n/1000 }'; }
 
-printf '%s[%s%s%s] %s%d%%%s контекста осталось %s(%s/%s)%s' \
-  "${model:+$model  }" "$color" "$bar" "$reset" \
-  "$color" "$left" "$reset" "$dim" "$(fmt_k "$used")" "$(fmt_k "$size")" "$reset"
+# Time until a unix timestamp: "2ч 15м", "3д 4ч", "12м".
+until_ts() {
+  local d=$(( $1 - $(date +%s) ))
+  (( d < 0 )) && d=0
+  local days=$(( d / 86400 )) h=$(( d % 86400 / 3600 )) m=$(( d % 3600 / 60 ))
+  if   (( days > 0 )); then printf '%dд %dч' "$days" "$h"
+  elif (( h > 0 ));    then printf '%dч %dм' "$h" "$m"
+  else                      printf '%dм' "$m"
+  fi
+}
+
+# --- Context ---
+c=$(color_for "$left")
+line=$(printf '%s[%s%s%s] %s%d%%%s контекста осталось %s(%s/%s)%s' \
+  "${model:+$model  }" "$c" "$(bar "$left" "$BAR_WIDTH")" "$reset" \
+  "$c" "$left" "$reset" "$dim" "$(fmt_k "$used")" "$(fmt_k "$size")" "$reset")
+
+# --- Subscription limits (only Pro/Max/Ultra, after the first API response) ---
+LIMIT_BAR_WIDTH=${LIMIT_BAR_WIDTH:-10}
+limit_segment() {   # <json key> <label>
+  local pct reset_at lim cc extra=""
+  pct=$(jqr ".rate_limits.$1.used_percentage")
+  [ -z "$pct" ] && return
+  reset_at=$(jqr ".rate_limits.$1.resets_at")
+  lim=$(( 100 - $(printf '%.0f' "$pct") ))
+  (( lim < 0 )) && lim=0
+  if [ "$1" = "spend_limit" ]; then
+    local u l
+    u=$(jqr '.rate_limits.spend_limit.used_usd'); l=$(jqr '.rate_limits.spend_limit.limit_usd')
+    [ -n "$u" ] && [ -n "$l" ] && extra=$(printf ' $%.0f/$%.0f' "$u" "$l")
+  fi
+  cc=$(color_for "$lim")
+  printf '  %s%s%s [%s%s%s] %s%d%%%s%s' "$dim" "$2" "$reset" \
+    "$cc" "$(bar "$lim" "$LIMIT_BAR_WIDTH")" "$reset" "$cc" "$lim" "$reset" "$extra"
+  [ -n "$reset_at" ] && printf ' %s↻ %s%s' "$dim" "$(until_ts "$reset_at")" "$reset"
+}
+
+line+=$(limit_segment five_hour "5ч")
+line+=$(limit_segment seven_day "неделя")
+line+=$(limit_segment spend_limit "бюджет")
+
+printf '%s' "$line"
