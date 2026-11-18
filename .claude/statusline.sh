@@ -3,7 +3,9 @@
 # Reads the status-line JSON from stdin. Requires jq.
 #
 # Example output:
-#   Opus  [████████████░░░░░░░░] 62% контекста осталось (76k/200k)  5ч [████████░░] 77% ↻ 2ч 15м  неделя [██████░░░░] 59% ↻ 3д 4ч
+#   Контекст         ████████████░░░░░░░░  осталось  62%  занято 76k из 200k токенов
+#   Лимит на 5 часов ███████████████░░░░░  осталось  76%  обновится через 2 ч 15 мин
+#   Лимит на неделю  ███░░░░░░░░░░░░░░░░░  осталось  15%  обновится через 3 дн 4 ч
 
 input=$(cat)
 BAR_WIDTH=${CONTEXT_BAR_WIDTH:-20}
@@ -65,45 +67,46 @@ bar() {
 
 fmt_k() { awk -v n="$1" 'BEGIN { if (n >= 1000000) printf "%.1fM", n/1000000; else printf "%dk", n/1000 }'; }
 
-# Time until a unix timestamp: "2ч 15м", "3д 4ч", "12м".
-until_ts() {
+# Time until reset in plain words: "2 ч 15 мин", "3 дн 4 ч", "12 мин".
+until_words() {
   local d=$(( $1 - $(date +%s) ))
   (( d < 0 )) && d=0
   local days=$(( d / 86400 )) h=$(( d % 86400 / 3600 )) m=$(( d % 3600 / 60 ))
-  if   (( days > 0 )); then printf '%dд %dч' "$days" "$h"
-  elif (( h > 0 ));    then printf '%dч %dм' "$h" "$m"
-  else                      printf '%dм' "$m"
+  if   (( days > 0 )); then printf '%d дн %d ч' "$days" "$h"
+  elif (( h > 0 ));    then printf '%d ч %d мин' "$h" "$m"
+  else                      printf '%d мин' "$m"
   fi
 }
 
+# row <label> <percent_left> <comment>
+row() {
+  local cc; cc=$(color_for "$2")
+  printf '%s %s%s%s  %sосталось %3d%%%s  %s%s%s\n' \
+    "$1" "$cc" "$(bar "$2" "$BAR_WIDTH")" "$reset" "$cc" "$2" "$reset" "$dim" "$3" "$reset"
+}
+
 # --- Context ---
-c=$(color_for "$left")
-line=$(printf '%s[%s%s%s] %s%d%%%s контекста осталось %s(%s/%s)%s' \
-  "${model:+$model  }" "$c" "$(bar "$left" "$BAR_WIDTH")" "$reset" \
-  "$c" "$left" "$reset" "$dim" "$(fmt_k "$used")" "$(fmt_k "$size")" "$reset")
+out=$(row "Контекст        " "$left" "занято $(fmt_k "$used") из $(fmt_k "$size") токенов")
 
 # --- Subscription limits (only Pro/Max/Ultra, after the first API response) ---
-LIMIT_BAR_WIDTH=${LIMIT_BAR_WIDTH:-10}
-limit_segment() {   # <json key> <label>
-  local pct reset_at lim cc extra=""
+limit_row() {   # <json key> <label>
+  local pct reset_at lim note=""
   pct=$(jqr ".rate_limits.$1.used_percentage")
   [ -z "$pct" ] && return
-  reset_at=$(jqr ".rate_limits.$1.resets_at")
   lim=$(( 100 - $(printf '%.0f' "$pct") ))
   (( lim < 0 )) && lim=0
   if [ "$1" = "spend_limit" ]; then
     local u l
     u=$(jqr '.rate_limits.spend_limit.used_usd'); l=$(jqr '.rate_limits.spend_limit.limit_usd')
-    [ -n "$u" ] && [ -n "$l" ] && extra=$(printf ' $%.0f/$%.0f' "$u" "$l")
+    [ -n "$u" ] && [ -n "$l" ] && note=$(printf 'потрачено $%.0f из $%.0f, ' "$u" "$l")
   fi
-  cc=$(color_for "$lim")
-  printf '  %s%s%s [%s%s%s] %s%d%%%s%s' "$dim" "$2" "$reset" \
-    "$cc" "$(bar "$lim" "$LIMIT_BAR_WIDTH")" "$reset" "$cc" "$lim" "$reset" "$extra"
-  [ -n "$reset_at" ] && printf ' %s↻ %s%s' "$dim" "$(until_ts "$reset_at")" "$reset"
+  reset_at=$(jqr ".rate_limits.$1.resets_at")
+  [ -n "$reset_at" ] && note+="обновится через $(until_words "$reset_at")"
+  printf '\n'; row "$2" "$lim" "$note"
 }
 
-line+=$(limit_segment five_hour "5ч")
-line+=$(limit_segment seven_day "неделя")
-line+=$(limit_segment spend_limit "бюджет")
+out+=$(limit_row five_hour   "Лимит на 5 часов")
+out+=$(limit_row seven_day   "Лимит на неделю ")
+out+=$(limit_row spend_limit "Бюджет          ")
 
-printf '%s' "$line"
+printf '%s\n' "$out"
